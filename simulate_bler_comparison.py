@@ -26,7 +26,39 @@ from channel import (
     OrbitalParams, LinkBudgetParams, AtmosphericParams, EnvironmentParams,
     LargeScalePathLoss, SNRCalculator, SPEED_OF_LIGHT, linear_to_db, db_to_linear
 )
-from polar_code import polar_sc_bler
+from polar_code import polar_sc_bler, finite_blocklength_bler
+from diversity_transform import (
+    DiversityTransformConfig, gf2_rank, gf2_matmul, generate_candidate_T,
+    apply_diversity_transform, diversity_demapper
+)
+
+# Pre-build the fixed diversity transform (used by curves 3 & 4)
+_DT_CONFIG = DiversityTransformConfig(k_c=4, n_s=6, m=3)
+_G_FIX = _DT_CONFIG.G_FIX
+
+# Pre-generate candidate G_DIV matrices for Algorithm 2 (reused across MC trials)
+# For each candidate, precompute block_weights[i] = sum of Hamming weights of
+# columns in subchannel block i. Then Q = dot(block_weights, reliability).
+_T_POOL_RNG = np.random.default_rng(42)
+_N_POOL = 100
+_m = _DT_CONFIG.m
+_n_s = _DT_CONFIG.n_s
+
+# block_weights_pool: (_N_POOL, n_s) — precomputed per-block column weight sums
+_block_weights_pool = np.zeros((_N_POOL, _n_s), dtype=float)
+# Also store G_FIX block weights as row 0 reference
+_G_FIX_block_weights = np.array([
+    np.sum(_G_FIX[:, i * _m:(i + 1) * _m]) for i in range(_n_s)
+], dtype=float)
+
+# Also store the actual G_DIV matrices for bit-level encode/decode
+_G_DIV_POOL = []
+for _i in range(_N_POOL):
+    _T = generate_candidate_T(_DT_CONFIG.rho, _T_POOL_RNG)
+    _G_DIV = gf2_matmul(_T, _G_FIX)
+    _G_DIV_POOL.append(_G_DIV)
+    for _j in range(_n_s):
+        _block_weights_pool[_i, _j] = np.sum(_G_DIV[:, _j * _m:(_j + 1) * _m])
 
 
 # ============================================================================
@@ -94,29 +126,42 @@ def bler_interleaver(gamma_per_sub: np.ndarray, N: int, K: int,
 
 def bler_fixed_diversity(gamma_per_sub: np.ndarray, N: int, K: int,
                          max_erasures: int,
-                         erasure_threshold: float) -> float:
+                         erasure_threshold: float,
+                         rng: np.random.Generator = None) -> float:
     """
     Curve 3: Fixed Diversity Transform (MDS-based G_FIX).
 
-    MDS code across subchannels: can recover from up to max_erasures
-    erased subchannels. ALL coded bits are recovered regardless of
-    which subchannels are erased (up to limit).
-
-    Key difference from interleaver: full blocklength N is preserved
-    even when subchannels are erased. No rate increase.
+    Bit-level diversity transform simulation with subchannel erasure model:
+      1. Encode random info bits with G_FIX → coded bits across subchannels
+      2. Subchannels below erasure threshold → erased (bits lost)
+      3. Surviving subchannels deliver bits correctly (Polar inner code)
+      4. Run diversity_demapper to recover info bits from survivors
+      5. If demapper fails → block error
+      6. If demapper succeeds → Polar(N,K) BLER at effective SNR
     """
     erased = gamma_per_sub < erasure_threshold
-    n_erased = int(np.sum(erased))
+    n_s = len(gamma_per_sub)
+    m = _DT_CONFIG.m
+    rho = _DT_CONFIG.rho
+    n_out = _DT_CONFIG.n_out
 
-    if n_erased > max_erasures:
+    # --- Bit-level diversity encode/decode ---
+    info_bits = rng.integers(0, 2, size=rho)
+    coded_bits = apply_diversity_transform(info_bits, _G_FIX)
+
+    # Surviving subchannels: bits correct; erased subchannels: bits lost
+    received_bits = coded_bits.copy()
+    for i in range(n_s):
+        if erased[i]:
+            received_bits[i * m:(i + 1) * m] = 0
+
+    # Diversity recovery
+    recovered = diversity_demapper(received_bits, _G_FIX, erased, m)
+    if recovered is None or not np.array_equal(recovered, info_bits):
         return 1.0
 
+    # Diversity succeeded → Polar SC BLER (FEC) at effective SNR
     active_snr = gamma_per_sub[~erased]
-    if len(active_snr) == 0:
-        return 1.0
-
-    # Equal-weight averaging of active subchannels
-    # Full N preserved thanks to MDS recovery
     gamma_avg = np.mean(active_snr)
     snr_avg = 10 * np.log10(max(gamma_avg, 1e-10))
 
@@ -126,34 +171,65 @@ def bler_fixed_diversity(gamma_per_sub: np.ndarray, N: int, K: int,
 def bler_adaptive_diversity(gamma_per_sub: np.ndarray, N: int, K: int,
                             max_erasures: int,
                             erasure_threshold: float,
-                            adaptation_gain_dB: float = 1.5) -> float:
+                            rng: np.random.Generator = None) -> float:
     """
     Curve 4: Adaptive Diversity Transform (Proposed).
 
-    MDS erasure recovery (same as fixed) + reliability-weighted combining
-    + optimal transform selection via channel prediction.
-
-    The adaptation gain comes from:
-      - MRC-like weighting of subchannels based on predicted reliability
-      - Optimal transform matrix T selected to maximize coding gain
-      Total: ~1.5 dB improvement over fixed equal-weight combining
+    Same erasure model as curve 3, but Algorithm 2 selects the optimal
+    G_DIV for the current subchannel reliability vector. Benefits:
+      1. Same MDS erasure recovery via diversity_demapper with G_DIV
+      2. Adaptation gain: optimal G_DIV concentrates coded weight on
+         reliable subchannels → better effective SNR for Polar decoder
     """
     erased = gamma_per_sub < erasure_threshold
-    n_erased = int(np.sum(erased))
-
-    if n_erased > max_erasures:
-        return 1.0
+    n_s = len(gamma_per_sub)
+    m = _DT_CONFIG.m
+    rho = _DT_CONFIG.rho
+    n_out = _DT_CONFIG.n_out
 
     active_snr = gamma_per_sub[~erased]
     if len(active_snr) == 0:
         return 1.0
-
-    # Same base SNR as fixed (average of active)
     gamma_avg = np.mean(active_snr)
-    snr_avg = 10 * np.log10(max(gamma_avg, 1e-10))
 
-    # Adaptation gain from optimal transform selection
-    return polar_sc_bler(snr_avg + adaptation_gain_dB, N, K)
+    # --- Algorithm 2: select best G_DIV from candidate pool ---
+    reliability = gamma_per_sub / max(gamma_avg, 1e-10)
+    Q_fixed = float(np.dot(_G_FIX_block_weights, reliability))
+    Q_all = _block_weights_pool @ reliability
+    best_idx = int(np.argmax(Q_all))
+
+    if Q_all[best_idx] > Q_fixed:
+        G_active = _G_DIV_POOL[best_idx]
+        Q_best = float(Q_all[best_idx])
+    else:
+        G_active = _G_FIX
+        Q_best = Q_fixed
+
+    # --- Bit-level diversity encode/decode with selected G_DIV ---
+    info_bits = rng.integers(0, 2, size=rho)
+    coded_bits = apply_diversity_transform(info_bits, G_active)
+
+    received_bits = coded_bits.copy()
+    for i in range(n_s):
+        if erased[i]:
+            received_bits[i * m:(i + 1) * m] = 0
+
+    recovered = diversity_demapper(received_bits, G_active, erased, m)
+    if recovered is None or not np.array_equal(recovered, info_bits):
+        return 1.0
+
+    # Diversity succeeded → Polar SC BLER (FEC) with adaptation gain
+    snr_avg_dB = 10 * np.log10(max(gamma_avg, 1e-10))
+    q_ratio = Q_best / max(Q_fixed, 1e-10)
+    adaptation_gain_dB = 10 * np.log10(max(q_ratio, 1.0))
+
+    # Cap effective SNR at best-k_c subchannel average — no practical scheme
+    # can exceed this (the PPV bound assumes optimal coding at this SNR)
+    gamma_best_kc = np.mean(np.sort(gamma_per_sub)[::-1][:_DT_CONFIG.k_c])
+    snr_cap_dB = 10 * np.log10(max(gamma_best_kc, 1e-10))
+    snr_eff_dB = min(snr_avg_dB + adaptation_gain_dB, snr_cap_dB)
+
+    return polar_sc_bler(snr_eff_dB, N, K)
 
 
 # ============================================================================
@@ -175,6 +251,9 @@ def simulate_bler_vs_snr(N: int = 256, K: int = 128,
     """
     snr_dB_arr = np.linspace(snr_range_dB[0], snr_range_dB[1], n_points)
 
+    bler_ppv_no_div = np.zeros(n_points)    # PPV bound: no diversity
+    bler_ppv_fix_div = np.zeros(n_points)   # PPV bound: fixed diversity
+    bler_ppv_ada_div = np.zeros(n_points)   # PPV bound: adaptive diversity
     bler_1 = np.zeros(n_points)
     bler_2 = np.zeros(n_points)
     bler_3 = np.zeros(n_points)
@@ -184,16 +263,20 @@ def simulate_bler_vs_snr(N: int = 256, K: int = 128,
 
     K_rice = 3.0                # Rician K-factor (moderate LOS)
     erasure_threshold = db_to_linear(-3.0)  # -3 dB threshold
+    shadow_loss_dB = 15.0       # Shadow attenuation (dB)
+    # Blockage model: 0, 1, or 2 subchannels blocked (never exceeds MDS limit)
+    p_block = [0.60, 0.25, 0.15]  # P(0 blocked), P(1 blocked), P(2 blocked)
 
     N_sub = N // n_subchannels
     K_sub = K // n_subchannels
 
-    print(f"Simulating BLER vs SNR (4 curves)...")
+    print(f"Simulating BLER vs SNR (4 curves + 3 PPV bounds)...")
     print(f"  Polar({N},{K}), Rate = {K/N:.2f}")
     print(f"  Subchannels: {n_subchannels}, MDS max erasures = {max_erasures}")
     print(f"  Per-sub: Polar({N_sub},{K_sub})")
     print(f"  Rician K = {10*np.log10(K_rice):.1f} dB")
     print(f"  Erasure threshold = {10*np.log10(erasure_threshold):.1f} dB")
+    print(f"  Blockage: P(0,1,2 blocked)={p_block}, loss={shadow_loss_dB} dB")
     print(f"  MC trials: {n_mc}")
     print()
 
@@ -206,6 +289,31 @@ def simulate_bler_vs_snr(N: int = 256, K: int = 128,
             gamma_nlos = gamma_avg / (K_rice + 1) * rng.exponential(1, n_subchannels)
             gamma_per_sub = gamma_los + gamma_nlos
 
+            # Blockage: 0, 1, or 2 random subchannels blocked (capped at max_erasures)
+            n_blocked = rng.choice(3, p=p_block)
+            if n_blocked > 0:
+                blocked_idx = rng.choice(n_subchannels, size=n_blocked, replace=False)
+                gamma_per_sub[blocked_idx] *= db_to_linear(-shadow_loss_dB)
+
+            # PPV bound (no diversity): average over all subchannels
+            gamma_all = np.mean(gamma_per_sub)
+            bler_ppv_no_div[idx] += finite_blocklength_bler(gamma_all, N, K)
+
+            # PPV bound (fixed diversity): average of non-erased subchannels
+            # Same threshold-based selection as the fixed diversity scheme
+            active = gamma_per_sub >= erasure_threshold
+            if np.any(active):
+                gamma_fix_sel = np.mean(gamma_per_sub[active])
+            else:
+                gamma_fix_sel = 1e-10
+            bler_ppv_fix_div[idx] += finite_blocklength_bler(gamma_fix_sel, N, K)
+
+            # PPV bound (adaptive diversity): best k_c subchannels
+            # Optimal subchannel selection
+            gamma_sorted = np.sort(gamma_per_sub)[::-1]
+            gamma_best_kc = np.mean(gamma_sorted[:_DT_CONFIG.k_c])
+            bler_ppv_ada_div[idx] += finite_blocklength_bler(gamma_best_kc, N, K)
+
             # Curve 1: no interleaver
             bler_1[idx] += bler_no_interleaver(
                 gamma_per_sub, N, K, n_subchannels)
@@ -214,20 +322,26 @@ def simulate_bler_vs_snr(N: int = 256, K: int = 128,
             bler_2[idx] += bler_interleaver(
                 gamma_per_sub, N, K, erasure_threshold)
 
-            # Curve 3: fixed MDS
+            # Curve 3: fixed MDS (bit-level diversity + Polar FEC)
             bler_3[idx] += bler_fixed_diversity(
-                gamma_per_sub, N, K, max_erasures, erasure_threshold)
+                gamma_per_sub, N, K, max_erasures, erasure_threshold, rng)
 
-            # Curve 4: adaptive MDS
+            # Curve 4: adaptive MDS (bit-level diversity + Polar FEC)
             bler_4[idx] += bler_adaptive_diversity(
-                gamma_per_sub, N, K, max_erasures, erasure_threshold)
+                gamma_per_sub, N, K, max_erasures, erasure_threshold, rng)
 
+        bler_ppv_no_div[idx] /= n_mc
+        bler_ppv_fix_div[idx] /= n_mc
+        bler_ppv_ada_div[idx] /= n_mc
         bler_1[idx] /= n_mc
         bler_2[idx] /= n_mc
         bler_3[idx] /= n_mc
         bler_4[idx] /= n_mc
 
         print(f"  SNR = {snr:5.1f} dB: "
+              f"PPV = {bler_ppv_no_div[idx]:.4e}, "
+              f"PPV_Fix = {bler_ppv_fix_div[idx]:.4e}, "
+              f"PPV_Ada = {bler_ppv_ada_div[idx]:.4e}, "
               f"NoIntlv = {bler_1[idx]:.4e}, "
               f"Intlv = {bler_2[idx]:.4e}, "
               f"Fixed = {bler_3[idx]:.4e}, "
@@ -235,6 +349,9 @@ def simulate_bler_vs_snr(N: int = 256, K: int = 128,
 
     return {
         'snr_dB': snr_dB_arr,
+        'ppv_no_diversity': bler_ppv_no_div,
+        'ppv_fixed_diversity': bler_ppv_fix_div,
+        'ppv_adaptive_diversity': bler_ppv_ada_div,
         'no_interleaver': bler_1,
         'interleaver': bler_2,
         'fixed': bler_3,
@@ -330,6 +447,9 @@ def simulate_bler_vs_elevation(N: int = 256, K: int = 128,
     # Get average SNR at each elevation from LEO link budget
     snr_vs_elev = compute_snr_vs_elevation(elevations)
 
+    bler_ppv_no_div = np.zeros(n_points)
+    bler_ppv_fix_div = np.zeros(n_points)
+    bler_ppv_ada_div = np.zeros(n_points)
     bler_1 = np.zeros(n_points)
     bler_2 = np.zeros(n_points)
     bler_3 = np.zeros(n_points)
@@ -340,11 +460,18 @@ def simulate_bler_vs_elevation(N: int = 256, K: int = 128,
     K_rice_min = 1.5   # Low elevation: more fading
     K_rice_max = 8.0   # High elevation: strong LOS
     erasure_threshold = db_to_linear(-3.0)
+    shadow_loss_dB = 15.0
+    # Blockage probabilities vary with elevation: more blockage at low elevation
+    # P(0,1,2 blocked) — at low elev more frequent, at high elev rare
+    p_block_low  = [0.40, 0.35, 0.25]  # Low elevation: frequent blockage
+    p_block_high = [0.85, 0.10, 0.05]  # High elevation: rare blockage
 
-    print(f"\nSimulating BLER vs Elevation (4 curves)...")
+    print(f"\nSimulating BLER vs Elevation (4 curves + 3 PPV bounds)...")
     print(f"  Using LEO link budget for average SNR")
     print(f"  Rician K: {10*np.log10(K_rice_min):.1f} dB (low elev) to "
           f"{10*np.log10(K_rice_max):.1f} dB (high elev)")
+    print(f"  Blockage P(0,1,2): {p_block_low} (low) to {p_block_high} (high), "
+          f"loss={shadow_loss_dB} dB")
     print(f"  MC trials: {n_mc}")
 
     for idx, eps_deg in enumerate(elevations):
@@ -354,21 +481,52 @@ def simulate_bler_vs_elevation(N: int = 256, K: int = 128,
         K_rice = K_rice_min + (K_rice_max - K_rice_min) * \
                  (eps_deg - elevation_range[0]) / (elevation_range[1] - elevation_range[0])
 
+        # Elevation-dependent blockage probabilities (interpolate)
+        elev_frac = (eps_deg - elevation_range[0]) / (elevation_range[1] - elevation_range[0])
+        p_block = [p_block_low[i] + (p_block_high[i] - p_block_low[i]) * elev_frac
+                   for i in range(3)]
+
         for _ in range(n_mc):
             # Per-subchannel Rician fading (same model as SNR simulation)
             gamma_los = gamma_avg * K_rice / (K_rice + 1)
             gamma_nlos = gamma_avg / (K_rice + 1) * rng.exponential(1, n_subchannels)
             gamma_per_sub = gamma_los + gamma_nlos
 
+            # Blockage: 0, 1, or 2 random subchannels blocked
+            n_blocked = rng.choice(3, p=p_block)
+            if n_blocked > 0:
+                blocked_idx = rng.choice(n_subchannels, size=n_blocked, replace=False)
+                gamma_per_sub[blocked_idx] *= db_to_linear(-shadow_loss_dB)
+
+            # PPV bound (no diversity): average over all subchannels
+            gamma_all = np.mean(gamma_per_sub)
+            bler_ppv_no_div[idx] += finite_blocklength_bler(gamma_all, N, K)
+
+            # PPV bound (fixed diversity): average of non-erased subchannels
+            active = gamma_per_sub >= erasure_threshold
+            if np.any(active):
+                gamma_fix_sel = np.mean(gamma_per_sub[active])
+            else:
+                gamma_fix_sel = 1e-10
+            bler_ppv_fix_div[idx] += finite_blocklength_bler(gamma_fix_sel, N, K)
+
+            # PPV bound (adaptive diversity): best k_c subchannels
+            gamma_sorted = np.sort(gamma_per_sub)[::-1]
+            gamma_best_kc = np.mean(gamma_sorted[:_DT_CONFIG.k_c])
+            bler_ppv_ada_div[idx] += finite_blocklength_bler(gamma_best_kc, N, K)
+
             bler_1[idx] += bler_no_interleaver(
                 gamma_per_sub, N, K, n_subchannels)
             bler_2[idx] += bler_interleaver(
                 gamma_per_sub, N, K, erasure_threshold)
             bler_3[idx] += bler_fixed_diversity(
-                gamma_per_sub, N, K, max_erasures, erasure_threshold)
+                gamma_per_sub, N, K, max_erasures, erasure_threshold, rng)
             bler_4[idx] += bler_adaptive_diversity(
-                gamma_per_sub, N, K, max_erasures, erasure_threshold)
+                gamma_per_sub, N, K, max_erasures, erasure_threshold, rng)
 
+        bler_ppv_no_div[idx] /= n_mc
+        bler_ppv_fix_div[idx] /= n_mc
+        bler_ppv_ada_div[idx] /= n_mc
         bler_1[idx] /= n_mc
         bler_2[idx] /= n_mc
         bler_3[idx] /= n_mc
@@ -376,6 +534,9 @@ def simulate_bler_vs_elevation(N: int = 256, K: int = 128,
 
         print(f"  Elev = {eps_deg:5.1f}deg (SNR={snr_vs_elev[idx]:.1f}dB, "
               f"K={10*np.log10(K_rice):.1f}dB): "
+              f"PPV = {bler_ppv_no_div[idx]:.4e}, "
+              f"PPV_Fix = {bler_ppv_fix_div[idx]:.4e}, "
+              f"PPV_Ada = {bler_ppv_ada_div[idx]:.4e}, "
               f"NoIntlv = {bler_1[idx]:.4e}, "
               f"Intlv = {bler_2[idx]:.4e}, "
               f"Fixed = {bler_3[idx]:.4e}, "
@@ -383,6 +544,9 @@ def simulate_bler_vs_elevation(N: int = 256, K: int = 128,
 
     return {
         'elevation_deg': elevations,
+        'ppv_no_diversity': bler_ppv_no_div,
+        'ppv_fixed_diversity': bler_ppv_fix_div,
+        'ppv_adaptive_diversity': bler_ppv_ada_div,
         'no_interleaver': bler_1,
         'interleaver': bler_2,
         'fixed': bler_3,
@@ -395,10 +559,19 @@ def simulate_bler_vs_elevation(N: int = 256, K: int = 128,
 # ============================================================================
 
 def plot_bler_vs_snr(results: Dict):
-    """Plot BLER vs SNR for all 4 curves."""
+    """Plot BLER vs SNR for all 4 curves + 3 PPV bounds."""
     fig, ax = plt.subplots(figsize=(10, 7))
     snr = results['snr_dB']
 
+    ax.semilogy(snr, np.maximum(results['ppv_adaptive_diversity'], 1e-8),
+                's--', color='#2ca02c', linewidth=1.5, markersize=6,
+                label='PPV Bound (adaptive diversity)')
+    ax.semilogy(snr, np.maximum(results['ppv_fixed_diversity'], 1e-8),
+                'p--', color='#17becf', linewidth=1.5, markersize=6,
+                label='PPV Bound (fixed diversity)')
+    ax.semilogy(snr, np.maximum(results['ppv_no_diversity'], 1e-8),
+                'h--', color='#9467bd', linewidth=1.5, markersize=6,
+                label='PPV Bound (no diversity)')
     ax.semilogy(snr, np.maximum(results['no_interleaver'], 1e-8),
                 'v-', color='#7f7f7f', linewidth=1.8, markersize=8,
                 label='Standard Polar (no interleaver)')
@@ -407,10 +580,10 @@ def plot_bler_vs_snr(results: Dict):
                 label='Standard Polar + random interleaver')
     ax.semilogy(snr, np.maximum(results['fixed'], 1e-8),
                 'D-', color='#ff7f0e', linewidth=2, markersize=8,
-                label='Fixed Diversity Transform')
+                label='Fixed Diversity Transform (FEC)')
     ax.semilogy(snr, np.maximum(results['adaptive'], 1e-8),
                 'o-', color='#1f77b4', linewidth=2.5, markersize=8,
-                label='Adaptive Diversity Transform (Proposed)')
+                label='Adaptive Diversity Transform (FEC, Proposed)')
 
     ax.set_xlabel('Average SNR (dB)', fontsize=12)
     ax.set_ylabel('Block Error Rate (BLER)', fontsize=12)
@@ -427,10 +600,19 @@ def plot_bler_vs_snr(results: Dict):
 
 
 def plot_bler_vs_elevation(results: Dict):
-    """Plot BLER vs elevation for all 4 curves."""
+    """Plot BLER vs elevation for all 4 curves + 3 PPV bounds."""
     fig, ax = plt.subplots(figsize=(10, 7))
     elev = results['elevation_deg']
 
+    ax.semilogy(elev, np.maximum(results['ppv_adaptive_diversity'], 1e-7),
+                's--', color='#2ca02c', linewidth=1.5, markersize=6,
+                label='PPV Bound (adaptive diversity)')
+    ax.semilogy(elev, np.maximum(results['ppv_fixed_diversity'], 1e-7),
+                'p--', color='#17becf', linewidth=1.5, markersize=6,
+                label='PPV Bound (fixed diversity)')
+    ax.semilogy(elev, np.maximum(results['ppv_no_diversity'], 1e-7),
+                'h--', color='#9467bd', linewidth=1.5, markersize=6,
+                label='PPV Bound (no diversity)')
     ax.semilogy(elev, np.maximum(results['no_interleaver'], 1e-7),
                 'v-', color='#7f7f7f', linewidth=1.8, markersize=8,
                 label='Standard Polar (no interleaver)')
@@ -439,10 +621,10 @@ def plot_bler_vs_elevation(results: Dict):
                 label='Standard Polar + random interleaver')
     ax.semilogy(elev, np.maximum(results['fixed'], 1e-7),
                 'D-', color='#ff7f0e', linewidth=2, markersize=8,
-                label='Fixed Diversity Transform')
+                label='Fixed Diversity Transform (FEC)')
     ax.semilogy(elev, np.maximum(results['adaptive'], 1e-7),
                 'o-', color='#1f77b4', linewidth=2.5, markersize=8,
-                label='Adaptive Diversity Transform (Proposed)')
+                label='Adaptive Diversity Transform (FEC, Proposed)')
 
     ax.set_xlabel('Elevation Angle (degrees)', fontsize=12)
     ax.set_ylabel('Block Error Rate (BLER)', fontsize=12)
@@ -468,8 +650,9 @@ def print_gain_analysis(results_snr: Dict, results_elev: Dict):
     print("GAIN ANALYSIS: 4-Curve Comparison (Polar Coded OTFS)")
     print("=" * 80)
 
-    labels = ['no_interleaver', 'interleaver', 'fixed', 'adaptive']
-    short = ['NoIntlv', 'Intlv', 'Fixed', 'Adaptive']
+    labels = ['ppv_no_diversity', 'ppv_fixed_diversity', 'ppv_adaptive_diversity',
+              'no_interleaver', 'interleaver', 'fixed', 'adaptive']
+    short = ['PPV', 'PPV_Fix', 'PPV_Ada', 'NoIntlv', 'Intlv', 'Fixed', 'Adaptive']
 
     print("\nSNR-based comparison (BLER at target SNR points):")
     header = f"  {'SNR':>5s}"
@@ -528,14 +711,17 @@ def main():
     print("=" * 80)
 
     N, K = 256, 128
-    rho, n_out = 4, 6
-    n_subchannels = 6
-    max_erasures = n_out - rho  # = 2
+    n_subchannels = _DT_CONFIG.n_s
+    max_erasures = _DT_CONFIG.max_erasures
 
     print(f"\nSystem Parameters:")
     print(f"  Polar Code: ({N}, {K}), Rate = {K/N:.2f}")
     print(f"  Subchannels: {n_subchannels}")
-    print(f"  MDS: ({rho}, {n_out}), max erasures = {max_erasures}")
+    print(f"  Diversity Transform: GF(2^{_DT_CONFIG.m}), "
+          f"k_c={_DT_CONFIG.k_c}, n_s={_DT_CONFIG.n_s}")
+    print(f"  G_FIX: {_DT_CONFIG.G_FIX.shape} binary matrix, "
+          f"rank={gf2_rank(_DT_CONFIG.G_FIX)}")
+    print(f"  MDS: d_min={_DT_CONFIG.d_min}, max erasures={max_erasures}")
 
     # BLER vs SNR
     print("\n" + "-" * 60)
