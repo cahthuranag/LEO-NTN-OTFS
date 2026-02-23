@@ -20,41 +20,14 @@ Date   : 2026-02-06
 
 import numpy as np
 import math
-# Pure numpy/math implementations — no scipy dependency
-def _gammainc_reg(a, x):
-    """Regularised lower incomplete gamma P(a,x) via series expansion."""
-    return _gammainc_series(a, x)
-
-def _gammainc_upper(a, x):
-    """Upper regularised incomplete gamma = 1 - P(a,x)."""
-    return max(0.0, min(1.0, 1.0 - _gammainc_series(a, x)))
-
-def _gammainc_series(a, x):
-    """Series for lower regularised incomplete gamma P(a, x)."""
-    if x <= 0:
-        return 0.0
-    if a <= 0:
-        return 1.0
-    # Compute in log-space to avoid overflow
-    try:
-        log_prefix = -x + a * math.log(x) - math.lgamma(a)
-    except (ValueError, OverflowError):
-        return 0.0
-    if log_prefix < -700:
-        return 0.0
-    # Series: sum_{k=0}^inf x^k / (a*(a+1)*...*(a+k))
-    term = 1.0 / a
-    total = term
-    for k in range(1, 500):
-        term *= x / (a + k)
-        total += term
-        if abs(term) < 1e-15 * abs(total):
-            break
-    result = total * math.exp(log_prefix)
-    return max(0.0, min(1.0, result))
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional
 import warnings
+
+from fbl_analysis import (
+    FiniteBlocklengthBLER, q_function, q_inv,
+    regularised_lower_inc_gamma,
+)
 
 
 # ============================================================================
@@ -69,28 +42,6 @@ BOLTZMANN      = 1.380649e-23 # J/K
 #  Helper functions
 # ============================================================================
 
-def q_function(x) -> np.ndarray:
-    """Gaussian Q-function: Q(x) = 0.5 * erfc(x / sqrt(2))."""
-    x = np.asarray(x, dtype=float)
-    return 0.5 * np.vectorize(math.erfc)(x / np.sqrt(2.0))
-
-
-def q_inv(p: float) -> float:
-    """Inverse Q-function via bisection (scalar)."""
-    if p <= 0:
-        return np.inf
-    if p >= 1:
-        return -np.inf
-    # Simple bisection
-    lo, hi = -10.0, 10.0
-    for _ in range(100):
-        mid = (lo + hi) / 2.0
-        if float(q_function(mid)) > p:
-            lo = mid
-        else:
-            hi = mid
-    return (lo + hi) / 2.0
-
 
 def db_to_linear(x_db: float) -> float:
     return 10.0 ** (x_db / 10.0)
@@ -99,12 +50,6 @@ def db_to_linear(x_db: float) -> float:
 def linear_to_db(x_lin: float) -> float:
     return 10.0 * np.log10(np.maximum(x_lin, 1e-30))
 
-
-def regularised_lower_inc_gamma(a: float, x: float) -> float:
-    """Υ(a, x) = γ(a,x)/Γ(a)  — regularised lower incomplete gamma."""
-    if x <= 0:
-        return 0.0
-    return _gammainc_reg(a, x)
 
 
 # ============================================================================
@@ -603,161 +548,6 @@ class DDChannel:
             v_idx = int(tap_delays_bins[p]) % M_D
             h_dd[u_idx, v_idx] += tap_gains[p]
         return h_dd
-
-
-# ============================================================================
-#  Finite-Blocklength BLER  (Eqs. 39–52)
-# ============================================================================
-
-class FiniteBlocklengthBLER:
-    """
-    Compute block error probability under finite blocklength.
-    Implements Theorem 1, Proposition 1 (closed-form), and
-    Proposition 2 (high-SNR approximation).
-    """
-
-    @staticmethod
-    def capacity(gamma: float) -> float:
-        """C(γ) = log₂(1+γ)."""
-        return np.log2(1.0 + gamma)
-
-    @staticmethod
-    def dispersion(gamma: float) -> float:
-        """V(γ) = (1 - 1/(1+γ)²)(log₂ e)² — Eq. (42)."""
-        return (1.0 - 1.0 / (1.0 + gamma)**2) * (np.log2(np.e))**2
-
-    @classmethod
-    def conditional_bler(cls, gamma: float, n_c: int, R_c: float) -> float:
-        """
-        Conditional BLER ε(γ) for given SNR — Q-function approximation (Eq. 41).
-        """
-        C = cls.capacity(gamma)
-        V = cls.dispersion(gamma)
-        if V <= 0 or n_c <= 0:
-            return 0.0 if C >= R_c else 1.0
-        arg = (np.sqrt(n_c) * (C - R_c) + 0.5 * np.log2(n_c) / np.sqrt(n_c)) / np.sqrt(V)
-        return float(q_function(arg))
-
-    @classmethod
-    def average_bler_mc(cls, gamma_bar_SU: float, P_LOS: float,
-                         P_NLOS_taps: np.ndarray, K_LOS: float,
-                         n_c: int, R_c: float,
-                         gamma_bar_GS: float = np.inf,
-                         n_samples: int = 10000,
-                         rng: np.random.Generator = None) -> float:
-        """
-        Monte Carlo estimate of average BLER — Eq. (43).
-
-        Averages the conditional BLER over the combined SNR distribution
-        (shifted gamma from LOS + NLOS paths).
-        """
-        if rng is None:
-            rng = np.random.default_rng(42)
-
-        L_nlos = len(P_NLOS_taps)
-        gamma_det = gamma_bar_SU * P_LOS  # deterministic LOS SNR
-
-        bler_sum = 0.0
-        for _ in range(n_samples):
-            # NLOS: sum of L-1 exponential RVs (Rayleigh fading per tap)
-            gamma_nlos = 0.0
-            for p in range(L_nlos):
-                fading = rng.exponential(1.0)  # |w|² ~ Exp(1)
-                gamma_nlos += gamma_bar_SU * P_NLOS_taps[p] * fading
-
-            gamma_combined = gamma_det + gamma_nlos
-
-            # Apply cascaded SNR if feeder link is finite
-            if np.isfinite(gamma_bar_GS):
-                gamma_combined = (gamma_bar_GS * gamma_combined) / \
-                                 (gamma_bar_GS + gamma_combined + 1.0)
-
-            bler_sum += cls.conditional_bler(gamma_combined, n_c, R_c)
-
-        return bler_sum / n_samples
-
-    @staticmethod
-    def bler_closed_form(gamma_th: float, gamma_det: float,
-                          gamma_bar_NLOS: float, L_i: int) -> float:
-        """
-        Closed-form BLER approximation — Proposition 1 / Eq. (47).
-
-        ε ≈ Υ(L-1, (γ_th - γ_det) / γ̄_NLOS)
-        """
-        if gamma_th <= gamma_det:
-            return 0.0
-        if gamma_bar_NLOS <= 1e-30:
-            return 1.0  # no NLOS power → outage certain
-        x = (gamma_th - gamma_det) / gamma_bar_NLOS
-        a = L_i - 1
-        if a <= 0:
-            # Single-tap Rayleigh: CDF = 1 - exp(-x)
-            return 1.0 - math.exp(-min(x, 700))
-        return float(regularised_lower_inc_gamma(a, x))
-
-    @staticmethod
-    def bler_explicit(gamma_th: float, gamma_det: float,
-                       gamma_bar_NLOS: float, L_i: int) -> float:
-        """
-        Explicit series BLER — Eq. (48).
-
-        ε ≈ 1 - exp(-ξ) Σ_{m=0}^{L-2} ξ^m / m!
-        """
-        if gamma_th <= gamma_det:
-            return 0.0
-        if gamma_bar_NLOS <= 1e-30:
-            return 1.0
-        xi = (gamma_th - gamma_det) / gamma_bar_NLOS
-        if xi > 700:
-            return 1.0
-        s = sum(xi**m / math.factorial(m) for m in range(L_i - 1))
-        return 1.0 - math.exp(-xi) * s
-
-    @staticmethod
-    def bler_high_snr(gamma_th: float, gamma_det: float,
-                       gamma_bar_NLOS: float, L_i: int) -> float:
-        """
-        High-SNR BLER approximation — Proposition 2 / Eq. (49).
-
-        ε ≈ ξ^(L-1) exp(-ξ) / (L-1)!
-        """
-        if gamma_th <= gamma_det:
-            return 0.0
-        if gamma_bar_NLOS <= 1e-30:
-            return 1.0
-        xi = (gamma_th - gamma_det) / gamma_bar_NLOS
-        a = L_i - 1
-        if a <= 0:
-            return 1.0 - math.exp(-min(xi, 700))
-        if xi > 700:
-            return 0.0  # exp(-xi) dominates
-        return xi**a * math.exp(-xi) / math.factorial(a)
-
-    @staticmethod
-    def bler_rayleigh(gamma_th: float, gamma_bar_br: float,
-                       L_i: int) -> float:
-        """
-        Pure Rayleigh fading BLER (no LOS) — Eq. (51).
-
-        ε ≈ Υ(L, γ_th / γ̄_br)
-        """
-        if gamma_bar_br <= 0:
-            return 1.0
-        x = gamma_th / gamma_bar_br
-        return regularised_lower_inc_gamma(L_i, x)
-
-    @staticmethod
-    def piecewise_conditional_bler(gamma: float, psi: float, beta: float,
-                                    n_c: int) -> float:
-        """Piecewise linear approximation of conditional BLER — Eq. (44)."""
-        phi = psi - 1.0 / (2.0 * beta * np.sqrt(n_c))
-        delta = psi + 1.0 / (2.0 * beta * np.sqrt(n_c))
-        if gamma <= phi:
-            return 1.0
-        elif gamma >= delta:
-            return 0.0
-        else:
-            return 0.5 - beta * np.sqrt(n_c) * (gamma - psi)
 
 
 # ============================================================================

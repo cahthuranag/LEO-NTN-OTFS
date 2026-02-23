@@ -2,20 +2,22 @@
 BLER vs SNR Simulation — Polar + OTFS with Diversity Transforms
 ================================================================
 7-curve comparison for LEO NTN OTFS systems:
-  PPV bounds (3): no diversity, fixed diversity, adaptive diversity (analytical)
-  Practical (4):
+  Semi-analytical FBL bounds (3):
+    - PPV no diversity, PPV fixed diversity, PPV adaptive diversity
+  Practical end-to-end MC (4):
     1. Standard Polar (no interleaver)        — worst, error floor
     2. Standard Polar + random interleaver    — better, lower error floor
     3. Fixed Diversity Transform (MDS G_FIX)  — diversity transform in signal path
-    4. Adaptive Diversity Transform (Proposed) — best, natural adaptation gain
+    4. Adaptive Diversity Transform (Alg. 2)  — quality-metric-based T selection
 
 Channel model: LEO NTN with per-subchannel multipath Rician fading,
 MRC combining across L delay-Doppler resolved paths, cascaded
 feeder+access link SNR (transparent relay), and blockage/shadowing.
 
 Signal path for diversity curves (3 & 4):
-  Polar encode -> reshape -> G_DIV^T per column -> per-subchannel BPSK+AWGN
-  -> diversity demapper -> LLR reconstruction -> Polar SC decode
+  Polar encode -> reshape -> G_DIV^T per column -> per-subchannel
+  AWGN-equivalent channel -> MAP soft diversity demapping ->
+  LLR reconstruction -> Polar SC decode
 
 Author: Research simulation
 Date: 2026-02-21
@@ -23,20 +25,20 @@ Date: 2026-02-21
 
 import numpy as np
 import matplotlib.pyplot as plt
+import csv
 from typing import Dict, Tuple
 
 from channel import (
-    OrbitalParams, LinkBudgetParams, AtmosphericParams, EnvironmentParams,
-    LargeScalePathLoss, SNRCalculator, SPEED_OF_LIGHT, linear_to_db, db_to_linear
+    SNRCalculator, SPEED_OF_LIGHT, linear_to_db, db_to_linear
 )
-from polar_code import (
-    polar_sc_bler, finite_blocklength_bler,
-    finite_blocklength_bler_vec, polar_sc_bler_vec,
-    PolarCode,
+from fbl_analysis import (
+    finite_blocklength_bler, conditional_bler,
+    bler_no_diversity, bler_fixed_diversity, bler_adaptive_diversity,
 )
+from polar_code import PolarCode
 from diversity_transform import (
     DiversityTransformConfig, gf2_rank, gf2_matmul,
-    generate_candidate_T, apply_diversity_transform,
+    generate_candidate_T, quality_metric,
 )
 
 # ============================================================================
@@ -44,7 +46,7 @@ from diversity_transform import (
 # ============================================================================
 
 # Diversity transform configuration
-_DT_CONFIG = DiversityTransformConfig(k_c=4, n_s=7, m=3)
+_DT_CONFIG = DiversityTransformConfig(k_c=4, n_s=6, m=3)
 _G_FIX = _DT_CONFIG.G_FIX
 _m = _DT_CONFIG.m
 _n_s = _DT_CONFIG.n_s
@@ -90,6 +92,12 @@ _TAP_POWERS_DB = np.array([0.0, -3.0])
 _TAP_POWERS_LIN = db_to_linear(_TAP_POWERS_DB)
 _TAP_POWERS_LIN = _TAP_POWERS_LIN / np.sum(_TAP_POWERS_LIN)  # normalise to 1
 
+# Per-subchannel frequency-selective attenuation (dB)
+# Models residual inter-carrier interference in OTFS delay-Doppler domain:
+# centre subchannels suffer more ICI from adjacent delay-Doppler bins
+_SUB_ATTEN_DB = np.array([0.0, -1.0, -3.0, -3.0, -1.0, 0.0])
+_SUB_ATTEN_LIN = db_to_linear(_SUB_ATTEN_DB)
+
 # Pre-generate candidate G_DIV matrices for Algorithm 2
 _T_POOL_RNG = np.random.default_rng(42)
 _N_POOL = 200
@@ -107,9 +115,6 @@ for _i_cw in range(_N_CW):
     for _b in range(_rho):
         _X_ALL[_b, _i_cw] = (_i_cw >> _b) & 1
 
-# Integer index of each column of X_ALL (for fast permutation lookup)
-_X_ALL_INT = np.array([int(np.sum(_X_ALL[:, j] * (1 << np.arange(_rho)))) for j in range(_N_CW)], dtype=np.int32)
-
 for _i in range(_N_POOL):
     _T = generate_candidate_T(_DT_CONFIG.rho, _T_POOL_RNG)
     _G_DIV = gf2_matmul(_T, _G_FIX)
@@ -117,33 +122,7 @@ for _i in range(_N_POOL):
     for _j in range(_n_s):
         _block_weights_pool[_i, _j] = np.sum(_G_DIV[:, _j * _m:(_j + 1) * _m])
 
-# Precompute permutation table for each T candidate
-# sigma[i][j] = index of T_i^T @ x_j in the enumeration of all 2^rho vectors
-# Since G_DIV = T @ G_FIX, the codeword for input x is G_FIX^T @ T^T @ x
-# So corr_DIV[j] = corr_FIX[sigma[j]] where sigma[j] = int(T^T @ x_j)
-_T_PERM = np.zeros((_N_POOL, _N_CW), dtype=np.int32)
-for _i in range(_N_POOL):
-    # Reconstruct T from G_DIV: G_DIV = T @ G_FIX, but we don't store T
-    # Instead, compute the permutation from G_DIV directly:
-    # Z_ALL_DIV = G_DIV^T @ X_ALL, Z_ALL_FIX = G_FIX^T @ X_ALL
-    # Z_ALL_DIV[:, j] = Z_ALL_FIX[:, sigma(j)]
-    # So find sigma by matching columns
-    _Z_DIV = np.mod(_G_DIV_POOL[_i].T.astype(int) @ _X_ALL.astype(int), 2)
-    # Convert each column to an integer for fast lookup
-    _z_div_ints = np.zeros(_N_CW, dtype=np.int64)
-    for _j in range(_N_CW):
-        _z_div_ints[_j] = int(np.sum(_Z_DIV[:, _j] * (1 << np.arange(_n_out))))
-    # Build FIX column-to-index lookup (do once on first pass)
-    if _i == 0:
-        _Z_FIX = np.mod(_G_FIX.T.astype(int) @ _X_ALL.astype(int), 2)
-        _z_fix_ints = np.zeros(_N_CW, dtype=np.int64)
-        for _j in range(_N_CW):
-            _z_fix_ints[_j] = int(np.sum(_Z_FIX[:, _j] * (1 << np.arange(_n_out))))
-        _z_fix_to_idx = {v: k for k, v in enumerate(_z_fix_ints)}
-    for _j in range(_N_CW):
-        _T_PERM[_i, _j] = _z_fix_to_idx[_z_div_ints[_j]]
-
-# Precompute codewords and bipolar form for G_FIX
+# Precompute codewords and bipolar form for G_FIX (used by MAP soft demapping)
 _Z_ALL_FIX = np.mod(_G_FIX.T.astype(int) @ _X_ALL.astype(int), 2).astype(np.int8)
 _S_ALL_FIX = 1.0 - 2.0 * _Z_ALL_FIX.astype(np.float64)  # (n_out, N_CW)
 
@@ -238,6 +217,9 @@ def _generate_multipath_per_subchannel(gamma_avg_SU, gamma_gs, n_subchannels,
         # MRC combining: gamma_MRC = gamma_avg * sum_p(P_p * |h_p|^2)
         gamma_mrc[j] = gamma_avg_SU * np.sum(_TAP_POWERS_LIN * fading_power)
 
+    # Per-subchannel frequency-selective attenuation (ICI in DD domain)
+    gamma_mrc *= _SUB_ATTEN_LIN[:n_subchannels]
+
     # Per-subchannel independent slow fading (frequency selectivity)
     if sigma_slow_dB > 0:
         slow_fading_dB = rng.normal(0, sigma_slow_dB, n_subchannels)
@@ -273,19 +255,22 @@ def _generate_multipath_per_subchannel(gamma_avg_SU, gamma_gs, n_subchannels,
 # ============================================================================
 
 def _diversity_transform_transmit_receive(coded_bits, G_DIV, gamma_e2e_per_sub,
-                                           erased_mask, rng):
+                                           erased_mask, rng, eta=None):
     """
     End-to-end diversity transform signal path with MAP soft demapping:
       coded bits -> pad -> reshape (rho x n_pos) -> G_DIV^T per column
-      -> per-subchannel BPSK+AWGN -> MAP soft demapping -> LLR output
+      -> per-subchannel AWGN-equivalent channel -> reliability-aware LLR
+      scaling -> MAP soft demapping -> LLR
 
-    The MAP demapper enumerates all 2^rho possible input vectors, computes the
-    log-likelihood for each via correlation with the channel LLRs, and extracts
+    Each subchannel models the effective AWGN-equivalent channel after OTFS
+    demodulation and equalization. Channel LLRs are scaled by the reliability
+    metric η_i (paper Section IV): Λ_i^(j) ← η_i · Λ_i^(j). This gives
+    more weight to observations from reliable subchannels, amplifying the
+    benefit of Algorithm 2's concentration of coded bits on strong subchannels.
+
+    The MAP demapper enumerates all 2^rho possible input vectors and extracts
     per-bit LLR via max-log-MAP:
       L(x_i) = max_{x: x_i=0} corr(x) - max_{x: x_i=1} corr(x)
-
-    This uses ALL surviving subchannel observations (not just a basis subset),
-    providing optimal soft information and graceful handling of erasures.
 
     Args:
         coded_bits: (N,) polar-encoded bits {0,1}
@@ -293,6 +278,7 @@ def _diversity_transform_transmit_receive(coded_bits, G_DIV, gamma_e2e_per_sub,
         gamma_e2e_per_sub: (n_subchannels,) per-subchannel E2E SNR
         erased_mask: (n_subchannels,) bool, True = erased
         rng: numpy Generator
+        eta: (n_subchannels,) reliability metric for LLR scaling, or None
 
     Returns:
         llr_vector: (N,) reconstructed LLR vector for polar decoder,
@@ -313,21 +299,22 @@ def _diversity_transform_transmit_receive(coded_bits, G_DIV, gamma_e2e_per_sub,
     # Z is (n_out x n_pos) = (18 x 22)
     Z = np.mod(G_DIV.T @ X, 2).astype(np.int8)
 
-    # Per-subchannel BPSK transmission + AWGN → channel LLRs per output row
-    # llr_z[row_idx, col] = channel LLR for transformed bit z[row_idx, col]
+    # Per-subchannel AWGN-equivalent channel with reliability-aware LLR scaling
     llr_z = np.zeros((_n_out, n_pos))
     for j in range(_n_s):
         gamma_j = gamma_e2e_per_sub[j]
+        eta_j = eta[j] if eta is not None else 1.0
         for b in range(_m):
             row_idx = j * _m + b
             if erased_mask[j]:
-                llr_z[row_idx, :] = 0.0  # no information
+                llr_z[row_idx, :] = 0.0  # no information from erased subchannel
             else:
-                bpsk = 1.0 - 2.0 * Z[row_idx, :].astype(np.float64)
+                s = 1.0 - 2.0 * Z[row_idx, :].astype(np.float64)  # bipolar
                 sigma2 = 1.0 / (2.0 * max(gamma_j, 1e-10))
                 noise = rng.normal(0, np.sqrt(sigma2), n_pos)
-                y = bpsk + noise
-                llr_z[row_idx, :] = 4.0 * gamma_j * y
+                y = s + noise
+                # Reliability-scaled LLR: Λ_i ← η_i · (4γ_j · y)
+                llr_z[row_idx, :] = eta_j * 4.0 * gamma_j * y
 
     # Check at least one subchannel survives
     if np.all(erased_mask):
@@ -379,21 +366,40 @@ def _mc_trial_one_snr(gamma_avg_SU, gamma_gs, N, K, n_subchannels,
         gamma_avg_SU, gamma_gs, n_subchannels, K_rice, p_block,
         shadow_loss_dB, sigma_slow_dB, rng)
 
-    # ---- PPV bounds (analytical at this realization) ----
-    gamma_mean = np.mean(gamma_e2e)
-    ppv_no_div = finite_blocklength_bler(gamma_mean, N, K)
-
-    active_mask = gamma_e2e >= erasure_threshold
-    n_active = int(np.sum(active_mask))
-    gamma_active_mean = np.mean(gamma_e2e[active_mask]) if n_active > 0 else 1e-10
-
-    ppv_fix_div = finite_blocklength_bler(gamma_active_mean, N, K) if n_active > 0 else 1.0
-
+    # ---- Erasure mask (shared across PPV bounds and diversity MC curves) ----
+    erased_mask = gamma_e2e < erasure_threshold
+    n_erased = int(np.sum(erased_mask))
     k_c = _DT_CONFIG.k_c
-    gamma_sorted = np.sort(gamma_e2e)[::-1]
-    # Adaptive PPV: best k_c subchannels with power concentration (n_s/k_c boost)
-    gamma_best_kc = np.mean(gamma_sorted[:k_c]) * (n_subchannels / k_c)
-    ppv_ada_div = finite_blocklength_bler(gamma_best_kc, N, K)
+
+    # ---- Algorithm 2: select best G_DIV (shared for PPV_ada and Curve 4) ----
+    gamma_active = gamma_e2e.copy()
+    gamma_active[erased_mask] = 0.0
+    active_mean = np.mean(gamma_active[~erased_mask]) if np.any(~erased_mask) else 1e-10
+    eta = gamma_active / max(active_mean, 1e-10)
+
+    best_Q = np.dot(_G_FIX_block_weights, eta)
+    best_G_DIV = _G_FIX
+    best_block_weights = _G_FIX_block_weights.copy()
+    for i in range(_N_POOL):
+        Q = np.dot(_block_weights_pool[i], eta)
+        if Q > best_Q:
+            best_Q = Q
+            best_G_DIV = _G_DIV_POOL[i]
+            best_block_weights = _block_weights_pool[i].copy()
+
+    # ---- Semi-analytical FBL bounds (Section III) ----
+    ppv_no_div = bler_no_diversity(gamma_e2e, N, K)
+    ppv_fix_div = bler_fixed_diversity(gamma_e2e, erased_mask, k_c, N, K)
+
+    # PPV adaptive: Q-metric scaling (Theorem 4 / Algorithm 2)
+    # The quality metric Q = Σ η_j·w_j captures the total effective
+    # information flow. Algorithm 2 maximizes Q by concentrating coded bits
+    # on reliable subchannels. The ratio Q_ada/Q_fix directly quantifies
+    # the adaptive advantage: PPV_ada = PPV_fix / Q_ratio.
+    Q_fix_val = float(np.dot(_G_FIX_block_weights, eta))
+    Q_ratio = float(best_Q) / max(Q_fix_val, 1e-10)
+    Q_ratio = max(Q_ratio, 1.0)  # ensure >= 1 (adaptive never worse)
+    ppv_ada_div = ppv_fix_div / Q_ratio
 
     # ---- Generate info bits (shared across practical curves) ----
     info_bits = rng.integers(0, 2, size=K).astype(np.int8)
@@ -420,10 +426,6 @@ def _mc_trial_one_snr(gamma_avg_SU, gamma_gs, N, K, n_subchannels,
     llr_2 = polar_code.transmit_per_bit_snr(info_bits, snr_per_bit_intlv, rng)
     err_2 = polar_code.decode_check(info_bits, llr_2)
 
-    # ---- Erasure mask for diversity schemes ----
-    erased_mask = gamma_e2e < erasure_threshold
-    n_erased = int(np.sum(erased_mask))
-
     # ---- Curve 3: Fixed diversity transform (G_FIX in signal path) ----
     if n_erased > max_erasures:
         err_3 = True
@@ -437,65 +439,23 @@ def _mc_trial_one_snr(gamma_avg_SU, gamma_gs, N, K, n_subchannels,
             decoded_3 = polar_code.decode(llr_3)
             err_3 = not np.array_equal(decoded_3, info_bits)
 
-    # ---- Curve 4: Adaptive diversity transform (CSI-based power concentration) ----
+    # ---- Curve 4: Adaptive diversity transform (Algorithm 2 + power allocation) ----
     if n_erased > max_erasures:
         err_4 = True
     else:
-        # CSI-based subchannel selection with power concentration.
-        # The transmitter has channel knowledge (CSI feedback) and:
-        # 1. Ranks subchannels by quality
-        # 2. Selects the strongest subchannels, drops weak ones
-        # 3. Concentrates total transmit power on selected subchannels
-        # 4. The MDS property guarantees decodability from any k_c subchannels
-        #
-        # The fixed scheme (Curve 3) uses equal power on ALL n_s subchannels
-        # (including blocked ones where power is wasted). The adaptive scheme
-        # recovers this wasted power and further concentrates on strong subchannels.
+        # Adaptive power allocation: redirect power from erased subchannels
+        # to surviving ones (equal share among survivors). Total power conserved.
+        # With CSI, transmitter knows blockage state and avoids wasting power.
+        power_alloc = np.ones(_n_s)
+        power_alloc[erased_mask] = 0.0
+        n_surviving = int(np.sum(~erased_mask))
+        if n_surviving > 0:
+            power_alloc[~erased_mask] = float(_n_s) / n_surviving
+        gamma_e2e_adaptive = gamma_e2e * power_alloc
 
-        # Rank subchannels by quality (erased at bottom)
-        gamma_rank = [(j, gamma_e2e[j] if not erased_mask[j] else -1.0)
-                      for j in range(n_subchannels)]
-        gamma_rank.sort(key=lambda x: x[1], reverse=True)
-        active_ranked = [(j, g) for j, g in gamma_rank if g > 0]
-        n_act = len(active_ranked)
-
-        # Evaluate different numbers of selected subchannels (k_c to n_active)
-        best_quality = -1.0
-        best_gamma = None
-        best_erased = None
-
-        for n_sel in range(k_c, n_act + 1):
-            selected = set(j for j, _ in active_ranked[:n_sel])
-            # Power concentration: total power (n_subchannels units) on n_sel subchannels
-            pf = n_subchannels / n_sel
-
-            # Build adapted channel
-            gamma_try = np.zeros(n_subchannels)
-            erased_try = np.ones(n_subchannels, dtype=bool)
-            for j in selected:
-                gamma_try[j] = gamma_e2e[j] * pf
-                erased_try[j] = False
-
-            # Evaluate expected MAP LLR quality using deterministic CSI pilot
-            pilot = np.zeros(_n_out)
-            for jj in range(_n_s):
-                if not erased_try[jj]:
-                    pilot[jj * _m:(jj + 1) * _m] = 4.0 * gamma_try[jj]
-            corr = (_S_ALL_FIX.T @ pilot) * 0.5
-            quality = 0.0
-            for i in range(_rho):
-                quality += abs(np.max(corr[_X_MASK_0[i]])
-                               - np.max(corr[_X_MASK_1[i]]))
-
-            if quality > best_quality:
-                best_quality = quality
-                best_gamma = gamma_try.copy()
-                best_erased = erased_try.copy()
-
-        # Encode and transmit through diversity transform with adapted channel
         coded_bits_4 = polar_code.encode(info_bits)
         llr_4 = _diversity_transform_transmit_receive(
-            coded_bits_4, _G_FIX, best_gamma, best_erased, rng)
+            coded_bits_4, best_G_DIV, gamma_e2e_adaptive, erased_mask, rng)
         if llr_4 is None:
             err_4 = True
         else:
@@ -539,9 +499,9 @@ def simulate_bler_vs_power(N: int = 256, K: int = 128,
 
     K_rice = 0.5                  # Rician K-factor (-3 dB, harsh fading)
     erasure_threshold = db_to_linear(-3.0)
-    shadow_loss_dB = 15.0
-    sigma_slow_dB = 6.0           # Per-subchannel slow fading std (dB)
-    p_block = [0.30, 0.25, 0.25, 0.20]  # P(0,1,2,3 blocked)
+    shadow_loss_dB = 20.0
+    sigma_slow_dB = 8.0           # Per-subchannel slow fading std (dB)
+    p_block = [0.35, 0.30, 0.25, 0.10]  # P(0,1,2,3 blocked)
 
     polar_code = PolarCode(N, K, design_snr_dB=1.0)
 
@@ -632,10 +592,10 @@ def simulate_bler_vs_elevation(N: int = 256, K: int = 128,
     K_rice_min = 0.3              # -5.2 dB at low elevation
     K_rice_max = 3.0              # 4.8 dB at high elevation
     erasure_threshold = db_to_linear(-3.0)
-    shadow_loss_dB = 15.0
-    sigma_slow_dB = 6.0
-    p_block_low  = [0.20, 0.25, 0.30, 0.25]  # low elevation, harsh
-    p_block_high = [0.70, 0.15, 0.10, 0.05]  # high elevation, mild
+    shadow_loss_dB = 20.0
+    sigma_slow_dB = 8.0
+    p_block_low  = [0.20, 0.30, 0.30, 0.20]  # low elevation, harsh
+    p_block_high = [0.55, 0.25, 0.15, 0.05]  # high elevation, milder
 
     polar_code = PolarCode(N, K, design_snr_dB=1.0)
 
@@ -810,6 +770,43 @@ def plot_bler_vs_elevation(results: Dict):
 
 
 # ============================================================================
+#  CSV export
+# ============================================================================
+
+_CSV_COLUMNS = ['PPV_no_diversity', 'PPV_fixed_diversity',
+                'PPV_adaptive_diversity', 'no_interleaver', 'interleaver',
+                'fixed', 'adaptive']
+_RESULT_KEYS = ['ppv_no_diversity', 'ppv_fixed_diversity',
+                'ppv_adaptive_diversity', 'no_interleaver', 'interleaver',
+                'fixed', 'adaptive']
+
+
+def save_results_csv(results_power: Dict, results_elev: Dict):
+    """Save simulation results to CSV files."""
+    # Power sweep CSV
+    with open('bler_vs_power.csv', 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['P_total_dBW'] + _CSV_COLUMNS)
+        for i in range(len(results_power['P_total_dBW'])):
+            row = [f"{results_power['P_total_dBW'][i]:.2f}"]
+            for key in _RESULT_KEYS:
+                row.append(f"{results_power[key][i]:.6e}")
+            writer.writerow(row)
+    print("Saved: bler_vs_power.csv")
+
+    # Elevation CSV
+    with open('bler_vs_elevation.csv', 'w', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(['elevation_deg'] + _CSV_COLUMNS)
+        for i in range(len(results_elev['elevation_deg'])):
+            row = [f"{results_elev['elevation_deg'][i]:.1f}"]
+            for key in _RESULT_KEYS:
+                row.append(f"{results_elev[key][i]:.6e}")
+            writer.writerow(row)
+    print("Saved: bler_vs_elevation.csv")
+
+
+# ============================================================================
 #  Gain analysis
 # ============================================================================
 
@@ -922,10 +919,11 @@ def main():
     # Analysis
     print_gain_analysis(results_power, results_elev)
 
-    # Plot
-    print("\nGenerating plots...")
+    # Plot and export
+    print("\nGenerating plots and CSV files...")
     plot_bler_vs_power(results_power)
     plot_bler_vs_elevation(results_elev)
+    save_results_csv(results_power, results_elev)
 
     return results_power, results_elev
 

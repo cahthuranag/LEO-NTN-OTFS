@@ -1,20 +1,16 @@
 """
-Polar Code — Construction, Encoding, SC Decoding & BLER Models
-===============================================================
+Polar Code — Construction, Encoding & SC Decoding (Section V)
+=============================================================
 Provides:
-  1. PPV finite-blocklength BLER approximation (analytical bounds)
-  2. PolarCode class: Gaussian-Approximation frozen set design,
-     recursive butterfly encoding, and SC (min-sum) decoding.
+  PolarCode class: Gaussian-Approximation frozen set design,
+  recursive butterfly encoding, and SC (min-sum) decoding.
 
 Author: Research implementation
 Date: 2026-02-07
 """
 
 import numpy as np
-from typing import Tuple
 from dataclasses import dataclass
-from scipy.special import erfc
-from scipy.stats import norm
 
 
 @dataclass
@@ -26,192 +22,6 @@ class PolarCodeParams:
     def __post_init__(self):
         self.R = self.K / self.N  # Code rate
         self.n = int(np.log2(self.N)) if self.N > 0 else 0
-
-
-def Q_func(x: float) -> float:
-    """Q-function: tail probability of standard normal."""
-    return 0.5 * erfc(x / np.sqrt(2))
-
-
-def capacity_awgn(snr_linear: float) -> float:
-    """AWGN channel capacity in bits/symbol."""
-    return 0.5 * np.log2(1 + snr_linear)
-
-
-def channel_dispersion(snr_linear: float) -> float:
-    """Channel dispersion for AWGN."""
-    if snr_linear <= 0:
-        return 0.0
-    return 0.5 * (1 - 1/(1 + snr_linear)**2) * (np.log2(np.e))**2
-
-
-def finite_blocklength_bler(snr_linear: float, N: int, K: int) -> float:
-    """
-    Finite blocklength BLER approximation.
-
-    Based on Polyanskiy-Poor-Verdu normal approximation:
-    ε ≈ Q((C - R)*sqrt(N/V))
-
-    For Polar codes with SC decoding, there's additional loss
-    compared to optimal decoding (~0.5-1 dB).
-    """
-    if snr_linear <= 0:
-        return 1.0
-
-    R = K / N
-    C = capacity_awgn(snr_linear)
-    V = channel_dispersion(snr_linear)
-
-    if V <= 0:
-        return 1.0 if R > C else 0.0
-
-    # Normal approximation
-    if C > R:
-        arg = (C - R) * np.sqrt(N / V)
-        bler = Q_func(arg)
-    else:
-        bler = 1.0
-
-    return np.clip(bler, 0, 1)
-
-
-def polar_sc_bler(snr_dB: float, N: int, K: int,
-                   sc_loss_dB: float = 0.5) -> float:
-    """
-    Polar code BLER with SC decoding.
-
-    SC decoder has ~0.5 dB loss compared to ML decoding.
-    SCL decoder recovers most of this loss.
-
-    Args:
-        snr_dB: Channel SNR in dB
-        N: Block length
-        K: Information bits
-        sc_loss_dB: SC decoder loss (default 0.5 dB)
-    """
-    # Apply SC decoder loss
-    effective_snr_dB = snr_dB - sc_loss_dB
-    snr_linear = 10 ** (effective_snr_dB / 10)
-
-    return finite_blocklength_bler(snr_linear, N, K)
-
-
-class PolarCodedSystem:
-    """
-    Polar coded system model.
-
-    Uses theoretical BLER approximation for efficiency.
-    """
-
-    def __init__(self, N: int, K: int, design_snr_dB: float = 1.0):
-        self.N = N
-        self.K = K
-        self.params = PolarCodeParams(N, K, design_snr_dB)
-        self.R = K / N
-
-    def bler_awgn(self, snr_dB: float, use_scl: bool = False) -> float:
-        """
-        Compute BLER for AWGN channel.
-
-        Args:
-            snr_dB: Channel SNR
-            use_scl: If True, assume SCL decoder (less loss)
-        """
-        sc_loss = 0.2 if use_scl else 0.5
-        return polar_sc_bler(snr_dB, self.N, self.K, sc_loss)
-
-    def bler_fading(self, snr_dB: float, fading_type: str = "awgn") -> float:
-        """
-        Compute BLER considering fading.
-
-        For Rayleigh fading, average BLER over SNR distribution.
-        """
-        if fading_type == "awgn":
-            return self.bler_awgn(snr_dB)
-
-        elif fading_type == "rayleigh":
-            # Average over Rayleigh fading
-            snr_lin = 10 ** (snr_dB / 10)
-            # Use Gauss-Hermite quadrature for integration
-            n_points = 20
-            x, w = np.polynomial.hermite.hermgauss(n_points)
-
-            bler_avg = 0.0
-            for xi, wi in zip(x, w):
-                # Map to exponential distribution
-                gamma = snr_lin * np.exp(np.sqrt(2) * xi)
-                snr_i = 10 * np.log10(max(gamma, 1e-10))
-                bler_avg += wi * self.bler_awgn(snr_i)
-
-            return np.clip(bler_avg / np.sqrt(np.pi), 0, 1)
-
-        else:
-            return self.bler_awgn(snr_dB)
-
-    def simulate_mc(self, snr_dB: float, n_trials: int,
-                    rng: np.random.Generator = None) -> float:
-        """
-        Monte Carlo simulation using BLER model.
-
-        Generates random channel realizations and computes BLER.
-        """
-        if rng is None:
-            rng = np.random.default_rng()
-
-        snr_lin = 10 ** (snr_dB / 10)
-        errors = 0
-
-        for _ in range(n_trials):
-            # Rayleigh fading gain
-            h2 = rng.exponential(1.0)
-            gamma = snr_lin * h2
-            gamma_dB = 10 * np.log10(max(gamma, 1e-10))
-
-            # BLER at this realization
-            bler = self.bler_awgn(gamma_dB)
-
-            # Random block error
-            if rng.random() < bler:
-                errors += 1
-
-        return errors / n_trials
-
-
-def finite_blocklength_bler_vec(snr_linear, N, K):
-    """
-    Vectorized finite blocklength BLER approximation.
-
-    All arguments can be numpy arrays (broadcastable).
-    Based on Polyanskiy-Poor-Verdu normal approximation.
-    """
-    snr_linear = np.asarray(snr_linear, dtype=float)
-    N = np.asarray(N, dtype=float)
-    K = np.asarray(K, dtype=float)
-    R = K / N
-    C = 0.5 * np.log2(np.maximum(1 + snr_linear, 1e-30))
-    V = 0.5 * (1 - 1 / (1 + snr_linear) ** 2) * (np.log2(np.e)) ** 2
-    arg = np.where(
-        (V > 0) & (C > R),
-        (C - R) * np.sqrt(N / np.maximum(V, 1e-30)),
-        0.0,
-    )
-    bler = np.where(
-        (V > 0) & (C > R),
-        0.5 * erfc(arg / np.sqrt(2)),
-        np.where(snr_linear > 0, 1.0, 1.0),
-    )
-    return np.clip(bler, 0, 1)
-
-
-def polar_sc_bler_vec(snr_dB, N, K, sc_loss_dB=0.5):
-    """
-    Vectorized Polar code BLER with SC decoding.
-
-    snr_dB, N, K can be numpy arrays (broadcastable).
-    """
-    snr_dB = np.asarray(snr_dB, dtype=float)
-    snr_linear = 10 ** ((snr_dB - sc_loss_dB) / 10)
-    return finite_blocklength_bler_vec(snr_linear, N, K)
 
 
 # ===================================================================
@@ -347,7 +157,7 @@ class PolarCode:
     # ---------- convenience methods ----------
     def encode_and_transmit(self, info_bits, snr_linear, rng):
         """
-        Encode → BPSK modulate → AWGN channel → compute LLRs.
+        Encode → bipolar mapping → AWGN channel → compute LLRs.
 
         Args:
             info_bits: (K,) info bits
@@ -357,12 +167,10 @@ class PolarCode:
             channel_llr: (N,) LLR values
         """
         x = self.encode(info_bits)
-        # BPSK: 0 → +1, 1 → −1
-        bpsk = 1.0 - 2.0 * x.astype(np.float64)
+        s = 1.0 - 2.0 * x.astype(np.float64)  # bipolar: 0→+1, 1→-1
         sigma2 = 1.0 / (2.0 * max(snr_linear, 1e-10))
         noise = rng.normal(0, np.sqrt(sigma2), self.N)
-        y = bpsk + noise
-        # LLR = 2*y / sigma^2 = 4*snr*y
+        y = s + noise
         channel_llr = 4.0 * snr_linear * y
         return channel_llr
 
@@ -378,7 +186,11 @@ class PolarCode:
 
     def transmit_per_bit_snr(self, info_bits, snr_per_bit, rng):
         """
-        Encode → BPSK → per-bit AWGN (each coded bit has its own SNR) → LLRs.
+        Encode → per-bit AWGN-equivalent channel → LLRs.
+
+        Each coded bit is transmitted through an independent AWGN-equivalent
+        channel (modelling the effective channel after OTFS demodulation)
+        with its own SNR.
 
         Args:
             info_bits: (K,) info bits
@@ -388,10 +200,10 @@ class PolarCode:
             channel_llr: (N,) LLR values
         """
         x = self.encode(info_bits)
-        bpsk = 1.0 - 2.0 * x.astype(np.float64)
+        s = 1.0 - 2.0 * x.astype(np.float64)  # bipolar mapping
         sigma2 = 1.0 / (2.0 * np.maximum(snr_per_bit, 1e-10))
         noise = rng.normal(0, 1.0, self.N) * np.sqrt(sigma2)
-        y = bpsk + noise
+        y = s + noise
         channel_llr = 4.0 * snr_per_bit * y
         return channel_llr
 
