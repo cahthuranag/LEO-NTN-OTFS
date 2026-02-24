@@ -1,9 +1,9 @@
 """
-Polar Code — Construction, Encoding & SC Decoding (Section V)
-=============================================================
+Polar Code — Construction, Encoding & SCL Decoding (Section V)
+===============================================================
 Provides:
   PolarCode class: Gaussian-Approximation frozen set design,
-  recursive butterfly encoding, and SC (min-sum) decoding.
+  recursive butterfly encoding, and SC / SCL decoding.
 
 Author: Research implementation
 Date: 2026-02-07
@@ -48,13 +48,14 @@ class PolarCode:
     recursive butterfly encoding, and successive-cancellation decoding.
     """
 
-    def __init__(self, N, K, design_snr_dB=1.0):
+    def __init__(self, N, K, design_snr_dB=1.0, list_size=8):
         assert N & (N - 1) == 0 and N > 0, "N must be a power of 2"
         assert 0 < K <= N
         self.N = N
         self.K = K
         self.n = int(np.log2(N))
         self.design_snr_dB = design_snr_dB
+        self.list_size = list_size
 
         # --- Gaussian-Approximation channel reliability ---
         design_snr_lin = 10 ** (design_snr_dB / 10.0)
@@ -106,18 +107,23 @@ class PolarCode:
             step <<= 1
         return x
 
-    # ---------- SC decoding ----------
+    # ---------- decoding ----------
     def decode(self, channel_llr):
         """
-        Successive-cancellation decoder (min-sum), recursive.
-
-        Uses in-place output array to avoid concatenation overhead.
+        Decode channel LLRs using SC (list_size=1) or SCL decoder.
 
         Args:
             channel_llr: (N,) LLR values  (positive = more likely 0)
         Returns:
             info_bits_hat: (K,) decoded info bits
         """
+        if self.list_size > 1:
+            return self._decode_scl(channel_llr)
+        return self._decode_sc(channel_llr)
+
+    # ---------- SC decoding ----------
+    def _decode_sc(self, channel_llr):
+        """Successive-cancellation decoder (min-sum), recursive."""
         u_hat = np.zeros(self.N, dtype=np.int8)
         self._sc_recurse(np.asarray(channel_llr, dtype=np.float64),
                          self.frozen_mask, u_hat, 0)
@@ -154,6 +160,114 @@ class PolarCode:
 
         self._sc_recurse(llr_g, frozen[half:], out, offset + half)
 
+    # ---------- SCL decoding ----------
+    def _decode_scl(self, channel_llr):
+        """
+        Successive Cancellation List (SCL) decoder with Tal-Vardy path metric.
+
+        Maintains L candidate paths through the SC tree. At each info bit,
+        forks all paths and prunes to the L best by accumulated path metric.
+
+        Args:
+            channel_llr: (N,) LLR values  (positive = more likely 0)
+        Returns:
+            info_bits_hat: (K,) decoded info bits from best path
+        """
+        N = self.N
+        n = self.n
+        L = self.list_size
+
+        # Per-path data structures
+        llr = np.zeros((L, n + 1, N))                # intermediate LLRs
+        ps = np.zeros((L, n + 1, N), dtype=np.int8)  # partial sums
+        u = np.zeros((L, N), dtype=np.int8)           # decided bits
+        pm = np.full(L, np.inf)                       # path metrics
+        pm[0] = 0.0
+        n_active = 1
+
+        # Channel LLRs at top stage for path 0
+        llr[0, n, :] = np.asarray(channel_llr, dtype=np.float64)
+
+        for i in range(N):
+            # --- LLR propagation from top stage down to stage 0 ---
+            top = n - 1 if i == 0 else (i & -i).bit_length() - 1
+
+            for s in range(top, -1, -1):
+                h = 1 << s
+                pstart = (i >> (s + 1)) << (s + 1)
+
+                if (i >> s) & 1 == 0:
+                    # f-node: min-sum
+                    a = llr[:n_active, s + 1, pstart:pstart + h]
+                    b = llr[:n_active, s + 1, pstart + h:pstart + 2 * h]
+                    abs_a, abs_b = np.abs(a), np.abs(b)
+                    res = np.minimum(abs_a, abs_b)
+                    signs = np.signbit(a) ^ np.signbit(b)
+                    llr[:n_active, s, pstart:pstart + h] = np.where(
+                        signs, -res, res)
+                else:
+                    # g-node: combine with partial sums
+                    a = llr[:n_active, s + 1, pstart:pstart + h]
+                    b = llr[:n_active, s + 1, pstart + h:pstart + 2 * h]
+                    c = ps[:n_active, s, pstart:pstart + h].astype(np.float64)
+                    llr[:n_active, s, pstart + h:pstart + 2 * h] = (
+                        a * (1.0 - 2.0 * c) + b)
+
+            # --- Decision ---
+            llr_i = llr[:n_active, 0, i]
+
+            if self.frozen_mask[i]:
+                # Frozen bit: all paths set bit=0
+                u[:n_active, i] = 0
+                ps[:n_active, 0, i] = 0
+                pm[:n_active] += np.maximum(0.0, -llr_i)
+            else:
+                # Info bit: fork each path into bit=0 and bit=1
+                pm_0 = pm[:n_active] + np.maximum(0.0, -llr_i)
+                pm_1 = pm[:n_active] + np.maximum(0.0, llr_i)
+                cand_pm = np.concatenate([pm_0, pm_1])
+                cand_parent = np.tile(np.arange(n_active), 2)
+                cand_bit = np.concatenate([
+                    np.zeros(n_active, dtype=np.int8),
+                    np.ones(n_active, dtype=np.int8)])
+
+                # Keep L best candidates
+                n_keep = min(2 * n_active, L)
+                order = np.argsort(cand_pm)[:n_keep]
+                parents = cand_parent[order]
+                bits = cand_bit[order]
+
+                # Copy parent states (fancy indexing creates new arrays)
+                new_llr = llr[parents].copy()
+                new_ps = ps[parents].copy()
+                new_u = u[parents].copy()
+                new_pm = cand_pm[order]
+
+                new_u[:, i] = bits
+                new_ps[:, 0, i] = bits
+
+                llr[:n_keep] = new_llr
+                ps[:n_keep] = new_ps
+                u[:n_keep] = new_u
+                pm[:n_keep] = new_pm
+                n_active = n_keep
+
+            # --- Partial sum propagation upward ---
+            ii, s = i, 0
+            while ii & 1:
+                h = 1 << s
+                bstart = (ii >> 1) << (s + 1)
+                left = ps[:n_active, s, bstart:bstart + h]
+                right = ps[:n_active, s, bstart + h:bstart + 2 * h]
+                ps[:n_active, s + 1, bstart:bstart + h] = left ^ right
+                ps[:n_active, s + 1, bstart + h:bstart + 2 * h] = right
+                ii >>= 1
+                s += 1
+
+        # Return info bits from path with lowest metric
+        best = np.argmin(pm[:n_active])
+        return u[best, self.info_indices]
+
     # ---------- convenience methods ----------
     def encode_and_transmit(self, info_bits, snr_linear, rng):
         """
@@ -176,7 +290,7 @@ class PolarCode:
 
     def decode_check(self, info_bits, channel_llr):
         """
-        SC decode and compare with original info bits.
+        Decode and compare with original info bits.
 
         Returns:
             True if block error (decoded != original).
@@ -209,31 +323,44 @@ class PolarCode:
 
 
 if __name__ == "__main__":
-    print("Polar Code — Construction, Encoding, SC Decoding")
+    print("Polar Code — Construction, Encoding, SC/SCL Decoding")
     print("=" * 55)
 
     N, K = 256, 128
-    pc = PolarCode(N, K, design_snr_dB=1.0)
-    print(f"\nPolar({N},{K}), design SNR = 1.0 dB")
-    print(f"  Frozen bits: {int(np.sum(pc.frozen_mask))}")
-    print(f"  Info  bits:  {len(pc.info_indices)}")
 
-    # Round-trip test (noiseless)
+    # --- SCL(L=8) round-trip test ---
+    pc_scl = PolarCode(N, K, design_snr_dB=1.0, list_size=8)
+    print(f"\nPolar({N},{K}), design SNR = 1.0 dB, SCL L={pc_scl.list_size}")
+    print(f"  Frozen bits: {int(np.sum(pc_scl.frozen_mask))}")
+    print(f"  Info  bits:  {len(pc_scl.info_indices)}")
+
     rng = np.random.default_rng(42)
     info = rng.integers(0, 2, size=K).astype(np.int8)
-    llr_noiseless = pc.encode_and_transmit(info, snr_linear=1e6, rng=rng)
-    decoded = pc.decode(llr_noiseless)
-    print(f"\n  Round-trip (noiseless): {'PASS' if np.array_equal(decoded, info) else 'FAIL'}")
+    llr_noiseless = pc_scl.encode_and_transmit(info, snr_linear=1e6, rng=rng)
+    decoded = pc_scl.decode(llr_noiseless)
+    print(f"\n  Round-trip SCL (noiseless): {'PASS' if np.array_equal(decoded, info) else 'FAIL'}")
 
-    # BLER at a few SNR points via MC
-    print(f"\n  MC BLER test (1000 trials):")
-    for snr_dB in [0, 2, 4, 6]:
+    # --- SC(L=1) round-trip test ---
+    pc_sc = PolarCode(N, K, design_snr_dB=1.0, list_size=1)
+    rng2 = np.random.default_rng(42)
+    info2 = rng2.integers(0, 2, size=K).astype(np.int8)
+    llr_noiseless2 = pc_sc.encode_and_transmit(info2, snr_linear=1e6, rng=rng2)
+    decoded2 = pc_sc.decode(llr_noiseless2)
+    print(f"  Round-trip SC  (noiseless): {'PASS' if np.array_equal(decoded2, info2) else 'FAIL'}")
+
+    # --- BLER comparison: SC vs SCL ---
+    print(f"\n  MC BLER comparison (1000 trials):")
+    print(f"    {'SNR':>5s}  {'SC':>8s}  {'SCL-8':>8s}")
+    for snr_dB in [0, 2, 4]:
         snr_lin = 10 ** (snr_dB / 10)
-        errors = 0
+        errors_sc = 0
+        errors_scl = 0
         n_trials = 1000
         for _ in range(n_trials):
             ib = rng.integers(0, 2, size=K).astype(np.int8)
-            llr = pc.encode_and_transmit(ib, snr_lin, rng)
-            if pc.decode_check(ib, llr):
-                errors += 1
-        print(f"    SNR = {snr_dB} dB: BLER = {errors/n_trials:.4f}")
+            llr = pc_scl.encode_and_transmit(ib, snr_lin, rng)
+            if pc_sc.decode_check(ib, llr):
+                errors_sc += 1
+            if pc_scl.decode_check(ib, llr):
+                errors_scl += 1
+        print(f"    {snr_dB:3d}dB  {errors_sc/n_trials:.4f}  {errors_scl/n_trials:.4f}")
