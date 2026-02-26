@@ -145,7 +145,9 @@ def finite_blocklength_bler(snr_linear: float, N: int, K: int) -> float:
     if V <= 0:
         return 1.0 if R > C else 0.0
     if C > R:
-        arg = (C - R) * np.sqrt(N / V)
+        # PPV normal approximation with log correction — Eq. (41)
+        arg = (np.sqrt(N) * (C - R)
+               + 0.5 * np.log2(N) / np.sqrt(N)) / np.sqrt(V)
         bler = float(q_function(arg))
     else:
         bler = 1.0
@@ -162,11 +164,13 @@ def finite_blocklength_bler_vec(snr_linear, N, K):
     N = np.asarray(N, dtype=float)
     K = np.asarray(K, dtype=float)
     R = K / N
-    C = 0.5 * np.log2(np.maximum(1 + snr_linear, 1e-30))
-    V = 0.5 * (1 - 1 / (1 + snr_linear) ** 2) * (np.log2(np.e)) ** 2
+    C = np.log2(np.maximum(1 + snr_linear, 1e-30))
+    V = (1 - 1 / (1 + snr_linear) ** 2) * (np.log2(np.e)) ** 2
+    # PPV normal approximation with log correction — Eq. (41)
     arg = np.where(
         (V > 0) & (C > R),
-        (C - R) * np.sqrt(N / np.maximum(V, 1e-30)),
+        (np.sqrt(N) * (C - R) + 0.5 * np.log2(N) / np.sqrt(N))
+        / np.sqrt(np.maximum(V, 1e-30)),
         0.0,
     )
     bler = np.where(
@@ -327,23 +331,31 @@ class FiniteBlocklengthBLER:
 #  Semi-analytical BLER with diversity transforms (Section III)
 # ============================================================================
 
-def bler_no_diversity(gamma_per_sub: np.ndarray, N: int, K: int) -> float:
+def bler_no_diversity(gamma_per_sub: np.ndarray, erased_mask: np.ndarray,
+                      k_c: int, N: int, K: int) -> float:
     """
     Semi-analytical BLER without diversity transform — Section III.
 
-    Two complementary models capture different regimes:
-    - Harmonic-mean model (N): the harmonic mean is dominated by the weakest
-      subchannel, capturing the vulnerability of no-diversity schemes to deep
-      fades and blockage. At low-to-moderate SNR, a single blocked or deeply
-      faded subchannel drags the harmonic mean below the capacity threshold.
-    - Per-subchannel average (N/n_s): at high SNR, each blocked subchannel
-      contributes a fractional BLER proportional to its share of coded bits,
-      providing a natural floor above PPV_fix.
+    Uses the same conditional_bler function as the diversity bounds, but
+    applied per-subchannel at blocklength N_sub = N/n_s. Without a diversity
+    transform, each subchannel independently carries N_sub coded bits with
+    no erasure recovery. The overall BLER is the average of per-subchannel
+    conditional BLERs:
 
-    The maximum of the two models is used.
+      epsilon_no = (1/n_s) * sum_j conditional_bler(gamma_j, N_sub, R)
+
+    Blocked subchannels (rate > subchannel capacity) contribute epsilon~1,
+    creating a natural floor proportional to the blockage probability.
+    At moderate SNR, faded subchannels also contribute non-trivially.
+
+    The k_c threshold from the diversity transform is applied as a lower
+    bound: if even the MDS code cannot recover (<k_c surviving), a code
+    without diversity also fails.
 
     Args:
         gamma_per_sub: (n_s,) per-subchannel SNR (linear)
+        erased_mask: (n_s,) bool, True = erased
+        k_c: MDS code dimension (minimum surviving subchannels needed)
         N: polar code block length
         K: information bits
 
@@ -351,24 +363,21 @@ def bler_no_diversity(gamma_per_sub: np.ndarray, N: int, K: int) -> float:
         BLER at this channel realization.
     """
     n_s = len(gamma_per_sub)
-    N_sub = N // n_s          # coded bits per subchannel (~43 for N=256, n_s=6)
-    R = K / N                 # coding rate
+    N_sub = N // n_s
+    R = K / N
 
-    # Model A: harmonic mean SNR with full blocklength N
-    # Harmonic mean = n_s / Σ(1/γ_j) — sensitive to weak subchannels.
-    # Without diversity protection, the weakest subchannel limits performance.
-    harm_inv = float(np.sum(1.0 / np.maximum(gamma_per_sub, 1e-10)))
-    gamma_harm = n_s / harm_inv
-    p_harm = conditional_bler(gamma_harm, N, R)
+    # k_c threshold: if even diversity code fails, no-diversity also fails
+    surviving = gamma_per_sub[~erased_mask]
+    if len(surviving) < k_c:
+        return 1.0
 
-    # Model B: per-subchannel average with short blocklength N_sub
-    # Captures high-SNR regime where blockage causes fractional BLER
+    # Per-subchannel conditional BLER at blocklength N_sub
     p_avg = 0.0
     for j in range(n_s):
         p_avg += conditional_bler(gamma_per_sub[j], N_sub, R)
     p_avg /= n_s
 
-    return max(p_harm, p_avg)
+    return p_avg
 
 
 def bler_fixed_diversity(gamma_per_sub: np.ndarray, erased_mask: np.ndarray,

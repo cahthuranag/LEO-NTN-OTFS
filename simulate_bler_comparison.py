@@ -29,7 +29,8 @@ import csv
 from typing import Dict, Tuple
 
 from channel import (
-    SNRCalculator, SPEED_OF_LIGHT, linear_to_db, db_to_linear
+    SNRCalculator, SPEED_OF_LIGHT, linear_to_db, db_to_linear,
+    LargeScalePathLoss, AtmosphericParams, EnvironmentParams,
 )
 from fbl_analysis import (
     finite_blocklength_bler, conditional_bler,
@@ -85,6 +86,20 @@ _N0_UE_DBW = 10.0 * np.log10(_kB * _T0 * _BW_HZ) + _NF_UE_DB
 _FEEDER_GAIN_DB = _G_TX_GW_DBI + _G_RX_SAT_DBI - _FSPL_FEEDER_DB - _N0_SAT_DBW
 # Access link gain (excluding FSPL): γ_SU(dB) = P_SAT(dBW) + _ACCESS_GAIN_DB - FSPL_access
 _ACCESS_GAIN_EXCL_FSPL_DB = _G_TX_SAT_DBI + _G_RX_UE_DBI - _N0_UE_DBW
+
+# Atmospheric / environment models (ITU-R P.676, P.840, P.618; 3GPP NTN)
+_ATM_PARAMS = AtmosphericParams(
+    rho_wv=7.5,           # water-vapour density [g/m³]
+    H_gas_m=6000.0,       # equivalent gaseous thickness [m]
+    LWC=0.05,             # liquid-water content [g/m³]
+    H_cf_m=1000.0,        # cloud/fog layer thickness [m]
+    rain_rate_mmh=2.0,    # light rain [mm/h]
+    H_rain_m=3000.0,      # rain height [m]
+    kappa=0.0101,         # ITU rain atten. coeff (S-band)
+    beta=1.276,           # ITU rain atten. exponent
+)
+_ENV_PARAMS = EnvironmentParams(env_type="suburban")
+_PATH_LOSS_MODEL = LargeScalePathLoss(_ATM_PARAMS, _ENV_PARAMS)
 
 # Multipath TDL-D profile: L=2 taps, powers decay 3 dB per tap
 _L_TAPS = 2
@@ -143,11 +158,23 @@ def _access_fspl_dB(slant_range_m):
     return 20.0 * np.log10(4.0 * np.pi * slant_range_m / _LAMBDA_ACCESS)
 
 
-def _power_to_link_snrs(P_total_dBW, access_fspl_dB):
+def _atmospheric_loss_dB(elevation_deg):
+    """
+    Aggregate atmospheric attenuation for the access link (Eq. 7).
+
+    Includes gaseous absorption (ITU-R P.676), cloud/fog (ITU-R P.840),
+    and rain (ITU-R P.618) along the slant path at the given elevation.
+    """
+    epsilon_rad = np.radians(elevation_deg)
+    return _PATH_LOSS_MODEL.atmospheric_loss_dB(_F_ACCESS_HZ, epsilon_rad)
+
+
+def _power_to_link_snrs(P_total_dBW, access_fspl_dB, atm_loss_dB=0.0):
     """
     Convert total transmit power to per-link SNRs via link budgets.
 
     Equal power split: P_SAT = α · P_total, P_GW = (1-α) · P_total.
+    Access link loss includes FSPL + atmospheric attenuation (Eq. 6).
 
     Returns (gamma_gs_linear, gamma_su_linear).
     """
@@ -156,7 +183,8 @@ def _power_to_link_snrs(P_total_dBW, access_fspl_dB):
     P_GW_lin = (1.0 - _ALPHA_POWER) * P_total_lin
 
     gamma_gs_dB = linear_to_db(P_GW_lin) + _FEEDER_GAIN_DB
-    gamma_su_dB = linear_to_db(P_SAT_lin) + _ACCESS_GAIN_EXCL_FSPL_DB - access_fspl_dB
+    gamma_su_dB = (linear_to_db(P_SAT_lin) + _ACCESS_GAIN_EXCL_FSPL_DB
+                   - access_fspl_dB - atm_loss_dB)
 
     return db_to_linear(gamma_gs_dB), db_to_linear(gamma_su_dB)
 
@@ -369,7 +397,7 @@ def _mc_trial_one_snr(gamma_avg_SU, gamma_gs, N, K, n_subchannels,
             best_block_weights = _block_weights_pool[i].copy()
 
     # ---- Semi-analytical FBL bounds (Section III) ----
-    ppv_no_div = bler_no_diversity(gamma_e2e, N, K)
+    ppv_no_div = bler_no_diversity(gamma_e2e, erased_mask, k_c, N, K)
     ppv_fix_div = bler_fixed_diversity(gamma_e2e, erased_mask, k_c, N, K)
 
     # PPV adaptive: Q-metric scaling (Algorithm 2)
@@ -474,6 +502,7 @@ def simulate_bler_vs_power(N: int = 256, K: int = 128,
     # Access link geometry at reference elevation
     ref_slant = _slant_range_m(ref_elevation_deg)
     ref_fspl = _access_fspl_dB(ref_slant)
+    ref_atm_loss = _atmospheric_loss_dB(ref_elevation_deg)
 
     K_rice = 2.0                  # Rician K-factor (3 dB, NTN suburban)
     erasure_threshold = db_to_linear(-3.0)
@@ -492,6 +521,8 @@ def simulate_bler_vs_power(N: int = 256, K: int = 128,
     print(f"  Access link: S-band {_F_ACCESS_HZ/1e9:.0f} GHz, "
           f"G_tx={_G_TX_SAT_DBI:.0f} dBi, G_rx={_G_RX_UE_DBI:.0f} dBi, "
           f"elev={ref_elevation_deg:.0f}deg (d={ref_slant/1e3:.0f} km)")
+    print(f"  Atmospheric loss (Eq. 7): {ref_atm_loss:.2f} dB "
+          f"(gas+cloud/fog+rain at {ref_elevation_deg:.0f}deg)")
     print(f"  Multipath: L={_L_TAPS} taps, Rician K={10*np.log10(K_rice):.1f} dB")
     print(f"  Blockage: p_block={p_block_sub:.2f} per-subchannel, "
           f"loss={shadow_loss_dB} dB")
@@ -504,7 +535,7 @@ def simulate_bler_vs_power(N: int = 256, K: int = 128,
     results['P_total_dBW'] = power_dBW_arr
 
     for idx, p_dBW in enumerate(power_dBW_arr):
-        gamma_gs, gamma_su = _power_to_link_snrs(p_dBW, ref_fspl)
+        gamma_gs, gamma_su = _power_to_link_snrs(p_dBW, ref_fspl, ref_atm_loss)
 
         ppv_no_acc = 0.0
         ppv_fix_acc = 0.0
@@ -578,6 +609,8 @@ def simulate_bler_vs_elevation(N: int = 256, K: int = 128,
     print(f"\nComputing BLER vs Elevation (7 curves, end-to-end MC simulation)...")
     print(f"  P_total = {P_total_dBW:.1f} dBW ({10**(P_total_dBW/10):.2f} W), "
           f"alpha={_ALPHA_POWER}")
+    print(f"  Atmospheric loss (Eq. 7): gas + cloud/fog + rain, "
+          f"elev-dependent slant path")
     print(f"  Multipath: L={_L_TAPS} taps")
     print(f"  Rician K: {10*np.log10(K_rice_min):.1f} dB (low elev) to "
           f"{10*np.log10(K_rice_max):.1f} dB (high elev)")
@@ -592,10 +625,12 @@ def simulate_bler_vs_elevation(N: int = 256, K: int = 128,
     results['P_total_dBW'] = P_total_dBW
 
     for idx, eps_deg in enumerate(elevations):
-        # Elevation-dependent access link geometry
+        # Elevation-dependent access link geometry + atmospheric loss (Eq. 6-7)
         d_access = _slant_range_m(eps_deg)
         fspl_access = _access_fspl_dB(d_access)
-        gamma_gs, gamma_su = _power_to_link_snrs(P_total_dBW, fspl_access)
+        atm_loss = _atmospheric_loss_dB(eps_deg)
+        gamma_gs, gamma_su = _power_to_link_snrs(P_total_dBW, fspl_access,
+                                                   atm_loss)
         gamma_su_dB = linear_to_db(gamma_su)
 
         elev_frac = (eps_deg - elevation_range[0]) / (elevation_range[1] - elevation_range[0])
@@ -630,6 +665,7 @@ def simulate_bler_vs_elevation(N: int = 256, K: int = 128,
         results['adaptive'][idx] = err_counts[3] / n_mc
 
         print(f"  Elev = {eps_deg:5.1f}deg (d={d_access/1e3:.0f}km, "
+              f"atm={atm_loss:.1f}dB, "
               f"gamma_SU={gamma_su_dB:.1f}dB, K={10*np.log10(K_rice):.1f}dB, "
               f"p_blk={p_block_sub:.2f}): "
               f"NoIntlv = {results['no_interleaver'][idx]:.4e}, "
@@ -876,6 +912,11 @@ def main():
           f"NF={_NF_UE_DB:.0f} dB")
     print(f"    Power split: alpha={_ALPHA_POWER} (equal)")
     print(f"    BW={_BW_HZ/1e6:.0f} MHz, orbit={_H_ORB_M/1e3:.0f} km")
+    print(f"  Atmospheric model (Eq. 6-7):")
+    print(f"    Gaseous: ITU-R P.676 (rho_wv={_ATM_PARAMS.rho_wv} g/m3)")
+    print(f"    Cloud/fog: ITU-R P.840 (LWC={_ATM_PARAMS.LWC} g/m3)")
+    print(f"    Rain: ITU-R P.618 (rate={_ATM_PARAMS.rain_rate_mmh} mm/h)")
+    print(f"    Environment: {_ENV_PARAMS.env_type}")
 
     # BLER vs Total Transmit Power
     print("\n" + "-" * 60)
