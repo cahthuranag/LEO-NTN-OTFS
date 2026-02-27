@@ -549,6 +549,29 @@ class DDChannel:
             h_dd[u_idx, v_idx] += tap_gains[p]
         return h_dd
 
+    @staticmethod
+    def apply_fast(x_dd: np.ndarray, h_dd: np.ndarray,
+                   noise_var: float,
+                   rng: np.random.Generator = None) -> np.ndarray:
+        """
+        FFT-based DD-domain channel application (2D circular convolution).
+
+        Equivalent to apply() but O(NM log NM) instead of O(N²M²).
+
+        Y = IFFT2(FFT2(h_dd) * FFT2(x_dd)) + noise
+        """
+        if rng is None:
+            rng = np.random.default_rng()
+        N, M = x_dd.shape
+        H = np.fft.fft2(h_dd)
+        X = np.fft.fft2(x_dd)
+        y_dd = np.fft.ifft2(H * X)
+        # Add noise
+        w = np.sqrt(noise_var / 2) * (
+            rng.standard_normal((N, M)) + 1j * rng.standard_normal((N, M))
+        )
+        return y_dd + w
+
 
 # ============================================================================
 #  Ephemeris-Driven Outage Prediction (Eqs. 53–60)
