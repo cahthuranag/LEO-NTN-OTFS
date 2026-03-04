@@ -23,7 +23,7 @@ from sim_common import (
     create_ephemeris_predictor, mc_trial_one_snr,
     generate_multipath_per_subchannel, generate_dd_channel,
     diversity_transform_transmit_receive, diversity_transform_transmit_receive_otfs,
-    standard_polar_otfs, mmse_equalize_dd,
+    mmse_equalize_dd,
     db_to_linear, linear_to_db, SNRCalculator,
     G_FIX, G_FIX_BLOCK_WEIGHTS, G_DIV_POOL, BLOCK_WEIGHTS_POOL, N_POOL,
     RHO, N_OUT, M_GF, N_CW, X_ALL, S_ALL_FIX, X_MASK_0, X_MASK_1,
@@ -114,12 +114,6 @@ def _mc_trial_otfs_ofdm(gamma_avg_SU, gamma_gs, N, K, n_subchannels,
 
     # ====================== OTFS CURVES ======================
 
-    # OTFS: No interleaver
-    llr_otfs_1 = standard_polar_otfs(
-        info_bits, polar_code, h_dd, noise_var,
-        gamma_e2e_otfs_dd, n_subchannels, perm=None, rng=rng)
-    err_otfs_nointlv = polar_code.decode_check(info_bits, llr_otfs_1)
-
     # OTFS: Fixed diversity
     if n_erased_otfs > max_erasures:
         err_otfs_fix = True
@@ -155,20 +149,7 @@ def _mc_trial_otfs_ofdm(gamma_avg_SU, gamma_gs, N, K, n_subchannels,
 
     # ====================== OFDM CURVES ======================
 
-    # OFDM: No interleaver (per-subchannel AWGN with ICI-degraded SNR)
-    # QPSK per-bit SNR: Eb/N0 = Es/(2*N0) = gamma_symbol / 2
-    bits_per_sub = N // n_subchannels
-    snr_per_bit = np.zeros(N)
-    for s in range(n_subchannels):
-        start = s * bits_per_sub
-        end = min((s + 1) * bits_per_sub, N)
-        snr_per_bit[start:end] = gamma_e2e_ofdm[s] / 2.0
-    if bits_per_sub * n_subchannels < N:
-        snr_per_bit[bits_per_sub * n_subchannels:] = gamma_e2e_ofdm[-1] / 2.0
-    llr_ofdm_1 = polar_code.transmit_per_bit_snr(info_bits, snr_per_bit, rng)
-    err_ofdm_nointlv = polar_code.decode_check(info_bits, llr_ofdm_1)
-
-    # OFDM: Fixed diversity (legacy AWGN path with ICI-degraded SNR)
+    # OFDM: Fixed diversity (AWGN path with ICI-degraded SNR)
     if n_erased_ofdm > max_erasures:
         err_ofdm_fix = True
     else:
@@ -202,10 +183,8 @@ def _mc_trial_otfs_ofdm(gamma_avg_SU, gamma_gs, N, K, n_subchannels,
             err_ofdm_ada = not np.array_equal(polar_code.decode(llr_ofdm_ada), info_bits)
 
     return {
-        'otfs_no_interleaver': err_otfs_nointlv,
         'otfs_fixed': err_otfs_fix,
         'otfs_adaptive': err_otfs_ada,
-        'ofdm_no_interleaver': err_ofdm_nointlv,
         'ofdm_fixed': err_ofdm_fix,
         'ofdm_adaptive': err_ofdm_ada,
     }
@@ -245,8 +224,8 @@ def simulate(N=256, K=128, n_subchannels=N_S,
     print(f"OTFS vs OFDM: BLER vs Normalized Doppler")
     print(f"  P_total={P_total_dBW} dBW, elev={ref_elevation_deg}deg, MC={n_mc}")
 
-    curve_keys = ['otfs_no_interleaver', 'otfs_fixed', 'otfs_adaptive',
-                  'ofdm_no_interleaver', 'ofdm_fixed', 'ofdm_adaptive']
+    curve_keys = ['otfs_fixed', 'otfs_adaptive',
+                  'ofdm_fixed', 'ofdm_adaptive']
     results = {'f_D_norm': f_D_arr}
     for key in curve_keys:
         results[key] = np.zeros(n_points)
@@ -281,9 +260,6 @@ def plot(results):
     f_D = results['f_D_norm']
 
     # OTFS curves (solid)
-    ax.semilogy(f_D, np.maximum(results['otfs_no_interleaver'], 1e-8),
-                'v-', color='#7f7f7f', lw=1.0, ms=4,
-                label='OTFS: Standard Polar')
     ax.semilogy(f_D, np.maximum(results['otfs_fixed'], 1e-8),
                 'D-', color='#ff7f0e', lw=1.2, ms=4,
                 label='OTFS: Fixed diversity transform')
@@ -292,9 +268,6 @@ def plot(results):
                 label='OTFS: Adaptive diversity transform')
 
     # OFDM curves (dashed)
-    ax.semilogy(f_D, np.maximum(results['ofdm_no_interleaver'], 1e-8),
-                'v--', color='#7f7f7f', lw=1.0, ms=4, alpha=0.7,
-                label='OFDM: Standard Polar')
     ax.semilogy(f_D, np.maximum(results['ofdm_fixed'], 1e-8),
                 'D--', color='#ff7f0e', lw=1.2, ms=4, alpha=0.7,
                 label='OFDM: Fixed diversity transform')
@@ -322,8 +295,8 @@ def plot(results):
 
 
 def save_csv(results):
-    keys = ['otfs_no_interleaver', 'otfs_fixed', 'otfs_adaptive',
-            'ofdm_no_interleaver', 'ofdm_fixed', 'ofdm_adaptive']
+    keys = ['otfs_fixed', 'otfs_adaptive',
+            'ofdm_fixed', 'ofdm_adaptive']
     with open('otfs_vs_ofdm.csv', 'w', newline='') as f:
         w = csv.writer(f)
         w.writerow(['f_D_norm'] + keys)
